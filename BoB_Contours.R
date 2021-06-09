@@ -1,3 +1,5 @@
+# Written by Patrick Morrison for the Western Australian Museum, 2021
+
 library(shiny)
 library(akima) #interpolation
 library(raster) #spatial rasters
@@ -7,41 +9,38 @@ library(sp) #spatial
 library(lubridate) #dates
 library(tidyverse) #general data wrangling
 library(viridis) #palettes
+library(leaflet)
 options(digits=10)
 theme_set(theme_classic())
+options(shiny.maxRequestSize = 30*1024^2)
 
 ui <- fluidPage(
     
     # Application title
-    titlePanel("BoB Contours"),
+    titlePanel("Magnetometer Contours"),
     
     # Sidebar with a slider input for number of bins 
     sidebarLayout(
         sidebarPanel(
-            p("This application receives a raw BoB output as a csv file. It expects a six header rows, and the columns: Reading_Date, Reading_Time, Mag_Longitude, Mag_Latitude, and Magnetic_Field."),
-            fileInput("csv", 'BoB csv file:', multiple = FALSE, accept = NULL, width = NULL),
-            p('If you have a custom file, name the fields exactly date, time, lat, long and mag, and uncheck the raw data box below.'),
+            p("Interpolating magnetometer data using kriging, and converting it to a spatial format"),
+            p("This application receives a raw BoB output as a csv file. It expects header rows,
+              and the columns: Reading_Date, Reading_Time, Mag_Longitude, Mag_Latitude, and Magnetic_Field."),
+            p("The BoB header info can be different lenghts, so check the file for how many rows to skip. 5 or 6 is common:"),
+            numericInput("skip", "Skip rows", value=5, step = 1),
+            p('If you have a custom (non-BoB) file, name the fields exactly date, time, lat, long and mag, and uncheck the raw data box below.'),
             checkboxInput("raw", "Raw data from BoB", TRUE),
+            fileInput("csv", 'BoB csv file:', multiple = FALSE, accept = NULL, width = NULL),
             h3("Interpolation"),
             p('Turn up until it looks right.'),
             sliderInput("resx", h5("Resolution x"),
                         min = 20, max = 4000, value = 100),
             sliderInput("resy", h5("Resolution y"),
                         min = 20, max = 4000, value = 100),
-
             p("Use the graph to check output before downloading. This will output files for QGIS, in WGS84."),
             downloadButton("downloadpoints", "Download points"),
             downloadButton("downloadcontours", "Download contour"),
             downloadButton("downloadraster", "Download raster"),
-            h3("Preview settings"),
-            sliderInput("pht", h5("Preview height"),
-                        min = 100, max = 12000, value = 1200),
-            sliderInput("phw", h5("Preview width"),
-                        min = 100, max = 12000, value = 1200),
-            selectInput("plottype", "Plot type:",
-                        c("contour" = "contour",
-                          "raster" = "raster")),
-            checkboxInput("points", "Points", TRUE),
+            downloadButton("downloadcsv", "Download csv"),
             h3("Filtering"),
             checkboxInput("datefilter", "Filter date?", FALSE),
             dateInput("datestart", "Date start (YYYY-MM-DD)", value = "2021-05-19"),
@@ -53,7 +52,9 @@ ui <- fluidPage(
         tableOutput("table")),
         
         mainPanel(
-            plotOutput('finished_plot'),
+            #plotOutput('finished_plot'),
+            tags$style(type = "text/css", "#mymap {height: calc(100vh - 80px) !important;}"),
+            leafletOutput("mymap"),
             
         )
     )
@@ -64,10 +65,10 @@ server <- function(input, output) {
     
     mag <- reactive({
         req(input$csv)
-        
         if (input$raw) {
-        mag_import <- read_csv(input$csv$datapath, skip=6) %>%
-            dplyr::select('date' = Reading_Date, 'time' = Reading_Time, 'long' = Mag_Longitude, 'lat' = Mag_Latitude, 'mag' = Magnetic_Field) %>% #change this line to match data
+        mag_import <- read_csv(input$csv$datapath, skip=input$skip) %>%
+            dplyr::select('date' = Reading_Date, 'time' = Reading_Time, 'long' = Mag_Longitude,
+                          'lat' = Mag_Latitude, 'mag' = Magnetic_Field) %>% #change this line to match data
             na_if('*') %>%  na_if(0.00) %>% na.omit() %>% mutate_at(c('lat', 'long'), as.numeric)
         }
         
@@ -98,21 +99,27 @@ server <- function(input, output) {
         return(z)
     })
     
-    pht <-reactive({
-        input$pht
+    output$mymap <- renderLeaflet({
+        contours <- ContourLines2SLDF(contourLines(z()))
+        pal <- colorNumeric(
+            palette = "viridis",
+            domain = mag()$mag,
+            reverse = TRUE)
+        leaflet(options = leafletOptions(minZoom = 0, maxZoom = 23, preferCanvas = TRUE)) %>%
+            addTiles(group = "OpenStreetMap", options=tileOptions(updateWhenZooming = FALSE)) %>%
+            addProviderTiles(providers$CartoDB.Positron, group = "CartoDB Positron", options=tileOptions(updateWhenZooming = FALSE)) %>% 
+            addProviderTiles(providers$Esri.OceanBasemap, group = "ESRI Ocean", options=tileOptions(updateWhenZooming = FALSE)) %>% 
+            addProviderTiles(providers$Esri.WorldImagery, group = "ESRI World Imagery", options=tileOptions(updateWhenZooming = FALSE)) %>% 
+            addRasterImage(raster(z()), colors = rev(viridis(300)), opacity = 0.9, group = "Raster") %>%
+            addPolylines(data=contours, weight=1, color="black", group = "Contours") %>% 
+            addCircles(data= mag(), radius = 1, weight=4, group='Points',
+                             fillColor = 'black', stroke = TRUE, color=~pal(mag), label=~mag) %>%
+            hideGroup("Points") %>% 
+            addLayersControl(
+                baseGroups = c("OpenStreetMap", "ESRI Ocean", "CartoDB Positron", "ESRI World Imagery"),
+                overlayGroups = c("Contours", "Raster", "Points")) %>% 
+            addMeasure(primaryLengthUnit = "meters", secondaryLengthUnit  = "feet", primaryAreaUnit="sqmeters") %>% addScaleBar(position ="bottomleft")
     })
-    phw <-reactive({
-        input$phw
-    })
-    
-    output$finished_plot <- renderPlot({
-        req(mag())
-        req(z())
-        #plot these adjusted waypoints
-        if(input$plottype =='raster') plot(raster(z()), col = viridis(300))
-        if(input$plottype =='contour') contour(z(),asp=1)
-        if(input$points) points(mag(),  pch = 4, col = alpha('black', 0.4))
-    }, height = pht, width=phw)
 
     
     output$downloadpoints <- downloadHandler(
@@ -132,6 +139,13 @@ server <- function(input, output) {
         filename = "mag_raster.tif",
         content = function(file) {
             writeRaster(raster(z()), file, overwrite=TRUE)
+        }
+    )
+    
+    output$downloadcsv <- downloadHandler(
+        filename = "mag_processed.csv",
+        content = function(file) {
+            write_csv(data.frame(mag()), file)
         }
     )
     
